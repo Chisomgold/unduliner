@@ -1,0 +1,582 @@
+#!/usr/bin/env python
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+from PIL import Image
+import random
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.transforms as transforms
+from torch import optim
+from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler
+import torchvision
+from torchvision.datasets import ImageFolder
+import warnings
+import pysam
+import argparse
+import csv
+import subprocess
+from uuid import uuid4
+import pandas as pd
+from scipy.stats import ttest_ind, fisher_exact
+from statsmodels.stats import multitest
+from statsmodels.stats.proportion import proportions_ztest
+from sklearn.mixture import GaussianMixture
+
+import logging
+FORMAT = '%(asctime)s %(message)s'
+logging.basicConfig(format=FORMAT)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# Define architecture
+class Net(nn.Module):
+    def __init__(self, input_size, num_layers):
+        super(Net, self).__init__()
+        layers = []
+        # initial input and output channels
+        c_in = 3
+        c_out = 256
+
+        for i in range(num_layers):
+            layers.append(self.conv_block(c_in=c_in, c_out=c_out, dropout=0.4 if i == 0 else 0.25, kernel_size=3 if i != 0 else 5, stride=1, padding=1 if i != 0 else 2))
+            c_in = c_out
+            c_out = c_out // 2
+            if (i + 1) % 2 == 0:
+                layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
+
+        layers.append(nn.Conv2d(in_channels=c_in, out_channels=2, kernel_size=input_size // (2 ** ((num_layers + 1) // 2)), stride=1, padding=0))
+        layers.append(nn.Flatten())
+
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.model(x)
+
+    def conv_block(self, c_in, c_out, dropout,  **kwargs):
+        seq_block = nn.Sequential(
+            nn.Conv2d(in_channels=c_in, out_channels=c_out, **kwargs),
+            nn.BatchNorm2d(num_features=c_out),
+            nn.ReLU(),
+            nn.Dropout2d(p=dropout)
+        )
+
+        return seq_block
+
+#1: Separate reads by variant
+def separate_reads_by_variant(bam_file, vcf_file, output_dir):
+    logger.info("reading input files")
+    bam = pysam.AlignmentFile(bam_file, 'rb')
+    vcf_reader = pysam.VariantFile(vcf_file)
+
+    region_chrom = None
+    region_start = None
+    region_end = None
+
+    variant_count = 0
+    if args.chromosome:
+        region_chrom = args.chromosome
+
+    if args.region:
+        region_chrom, coords = args.region.split(':')
+        region_start, region_end = map(int, coords.split('-'))
+
+    empty_bams = {"alt": [], "ref": []} #for alleles with no supporting reads
+
+    for record in vcf_reader.fetch():
+        chrom = record.chrom
+        start = record.pos - 1
+        end = start + len(record.ref)
+        alt = record.alts[0]
+        ref = record.ref
+
+        #skip regions not matching user input
+        if region_chrom and chrom != region_chrom:
+            continue
+
+        if region_start and region_end and (start < region_start or end > region_end):
+            continue
+
+        with_variant = pysam.AlignmentFile(f'{output_dir}/{chrom}_{start}_{end}_{ref}_{alt}_with_variant.bam', 'wb', template=bam)
+        without_variant = pysam.AlignmentFile(f'{output_dir}/{chrom}_{start}_{end}_{ref}_{alt}_without_variant.bam', 'wb', template=bam)
+
+        logger.info(f"Processing VCF record: {record.chrom}:{record.pos}, REF: {record.ref}, ALT: {record.alts[0]}")
+        variant_count += 1
+
+        reads = bam.fetch(chrom, start, end)
+        read_list = list(reads)
+
+        wrote_alt = False
+        wrote_ref = False
+
+        for read in read_list:
+            if read.query_sequence is None:
+                continue
+            for positions in read.get_aligned_pairs():
+                if positions[0] is None:
+                    continue
+                if positions[1] == start:
+                    if read.query_sequence[positions[0]] == alt:
+                        with_variant.write(read)
+                        wrote_alt = True
+                        logger.debug(f"wrote {read.query_name} to with_variant; alt, ref is {alt}, {ref}; read has {read.query_sequence[positions[0]]}")
+                    elif read.query_sequence[positions[0]] == ref:
+                        without_variant.write(read)
+                        wrote_ref = True
+                        logger.debug(f"wrote {read.query_name} to without_variant; alt, ref is {alt}, {ref}; read has {read.query_sequence[positions[0]]}")
+
+        if not wrote_alt or not wrote_ref:
+            if not wrote_alt:
+                empty_bams["alt"].append((chrom, start, end, ref, alt))
+                variant_count -= 1
+            if not wrote_ref:
+                empty_bams["ref"].append((chrom, start, end, ref, alt))
+                variant_count -= 1
+
+            with_variant.close()
+            without_variant.close()
+            os.remove(f'{output_dir}/{chrom}_{start}_{end}_{ref}_{alt}_with_variant.bam')
+            os.remove(f'{output_dir}/{chrom}_{start}_{end}_{ref}_{alt}_without_variant.bam')
+            continue
+
+        with_variant.close()
+        without_variant.close()
+
+    report_path = "read_parse_summary.txt"
+
+    if empty_bams["alt"] or empty_bams["ref"]:
+        with open(report_path, "w") as report:
+            report.write("Skipped the following positions because at least one BAM was empty:\n")
+
+            if empty_bams["alt"]:
+                report.write("\nNo ALT-supporting reads for:\n")
+                for chrom, start, end, ref, alt in empty_bams["alt"]:
+                    report.write(f"{chrom}:{start}-{end} REF={ref} ALT={alt}\n")
+
+            if empty_bams["ref"]:
+                report.write("\nNo REF-supporting reads for:\n")
+                for chrom, start, end, ref, alt in empty_bams["ref"]:
+                    report.write(f"{chrom}:{start}-{end} REF={ref} ALT={alt}\n")
+
+    logger.info(f"Processed {variant_count} variants")
+    bam.close()
+    vcf_reader.close()
+
+#H: index BAM files
+def index_bam_files(output_dir):
+    logger.info("Indexing bam files")
+    for bam_file in os.listdir(output_dir):
+        if bam_file.endswith(".bam"):
+            bam_file_path = os.path.join(output_dir, bam_file)
+            sorted_bam = bam_file_path.replace(".bam", "_sorted.bam")
+
+            if not os.path.exists(sorted_bam):
+                subprocess.run(["samtools", "sort", "-o", sorted_bam, bam_file_path])
+            subprocess.run(["samtools", "index", sorted_bam])
+
+#2. Extract methylation data
+def create_methylation_array(bam_path, meth_cutoff=0.8, unmeth_cutoff=0.2):
+    bam = pysam.AlignmentFile(bam_path, "rb")
+    methylation_data = {}
+
+    for read in bam:
+        if read.query_sequence is None:
+            continue
+        read_id = read.query_name
+        aligned_positions = {query_pos: ref_pos for query_pos, ref_pos in read.get_aligned_pairs(matches_only=True)}
+
+        for key, values in read.modified_bases.items():
+            for base_pos, quality in values:
+                probability = 0
+                if quality / 255.0 > meth_cutoff:
+                    probability=1
+                if quality / 255.0 < unmeth_cutoff:
+                    probability=-1
+                if base_pos in aligned_positions:
+                    ref_pos = aligned_positions[base_pos]
+                    if ref_pos not in methylation_data:
+                        methylation_data[ref_pos] = {}
+                    methylation_data[ref_pos][read_id] = probability
+
+    genomic_positions = sorted(methylation_data.keys())
+    read_ids = list({read_id for pos_data in methylation_data.values() for read_id in pos_data})
+    methylation_array = np.full((len(genomic_positions), len(read_ids)), np.nan)
+
+    for i, pos in enumerate(genomic_positions):
+        for j, read_id in enumerate(read_ids):
+            if read_id in methylation_data[pos]:
+                methylation_array[i, j] = methylation_data[pos][read_id]
+
+    return methylation_array, genomic_positions, read_ids
+
+#3. Create Methylation Images
+def create_methylation_image(methylation_array1, methylation_array2, genomic_positions1, genomic_positions2, bam_filename, output_dir):
+    cmap=ListedColormap(['blue', 'grey', 'red']) #blue = -1, red = 1, grey =0 IGV mapping
+    region = os.path.splitext(os.path.basename(bam_filename))[0]
+    output_filename = os.path.join(output_dir, f"{region}_comparison.png")
+
+    aligned_arrays1, aligned_arrays2, _ = align_genomic_pos(methylation_array1, methylation_array2, genomic_positions1, genomic_positions2)
+
+    aligned_arrays1 = pad_array(aligned_arrays1, (10000, 50))
+    aligned_arrays2 = pad_array(aligned_arrays2, (10000, 50))
+
+    fig, axs = plt.subplots(2, 1, figsize=(12, 6), sharex=True, sharey=True)
+    fig.subplots_adjust(wspace=0.005)
+    axs[0].imshow(aligned_arrays1.T, cmap=cmap, aspect='auto', interpolation='nearest', vmin=-1, vmax=1)
+    axs[0].axis('off')
+    axs[1].imshow(aligned_arrays2.T, cmap=cmap, aspect='auto', interpolation='nearest', vmin=-1, vmax=1)
+    axs[1].axis('off')
+
+    #save fig to temporary file
+    temp_filename = os.path.join(output_dir, f"{region}_temp.png")
+    plt.savefig(temp_filename, bbox_inches='tight')
+    plt.close(fig)
+
+    # Crop excess white space from the image
+    cropped_image = crop_whitespace_from_image(temp_filename)
+    cropped_image.save(output_filename)
+
+    os.remove(temp_filename)
+
+    return output_filename
+
+#H:
+def pad_array(array, target_shape):
+    padded_array = np.full(target_shape, np.nan)
+    rows, cols = min(array.shape[0], target_shape[0]), min(array.shape[1], target_shape[1])
+    padded_array[:rows, :cols] = array[:rows, :cols]
+    return padded_array
+
+#H:
+def crop_whitespace_from_image(image_path):
+    img = Image.open(image_path).convert("RGB")
+    img_array = np.array(img)
+    original_dpi = img.info.get("dpi")
+
+    is_white = np.all(img_array > [245, 245, 245], axis=-1)
+
+    non_white_rows = np.where(~is_white.all(axis=1))[0]
+    non_white_cols = np.where(~is_white.all(axis=0))[0]
+
+    if non_white_rows.size > 0 and non_white_cols.size > 0:
+        top, bottom = non_white_rows[0]-5, non_white_rows[-1] + 10
+        top, bottom = max(0, top), min(img.height, bottom)
+
+        left, right = non_white_cols[0] - 10, non_white_cols[-1] + 10
+        left, right = max(0, left), min(img.width, right)
+        img_cropped = img.crop((left, top, right, bottom))
+
+        cropped_array = np.array(img_cropped)
+        is_white_cropped = np.all(cropped_array > [245, 245, 245], axis=-1)
+        non_white_rows_cropped = np.where(~is_white_cropped.all(axis=1))[0]
+
+        gaps = np.diff(non_white_rows_cropped)
+        large_gaps = np.where(gaps > 40)[0]
+
+        if len(large_gaps) > 0:
+            gap_start = non_white_rows_cropped[large_gaps[0]]
+            gap_end = non_white_rows_cropped[large_gaps[0] + 1]
+
+            keep_gap = 40
+            trim_top = gap_start + keep_gap // 2
+            trim_bottom = gap_end - keep_gap // 2
+
+            trim_top = max(0, min(trim_top, cropped_array.shape[0]))
+            trim_bottom = max(0, min(trim_bottom, cropped_array.shape[0]))
+            if trim_bottom > trim_top:
+                upper_part = cropped_array[:trim_top, :, :]
+                lower_part = cropped_array[trim_bottom:, :, :]
+                combined = np.vstack([upper_part, lower_part])
+                img_cropped = Image.fromarray(combined.astype(np.uint8))
+        img_cropped.info["dpi"] = original_dpi
+        return img_cropped
+    img.info["dpi"] = original_dpi
+
+    return img
+
+#H:
+def align_genomic_pos(a1, a2, gp1, gp2):
+    all_gps = sorted(set(gp1) | set(gp2))
+
+    pos1_to_idx = {pos: idx for idx, pos in enumerate(gp1)}
+    pos2_to_idx = {pos: idx for idx, pos in enumerate(gp2)}
+
+    aligned1 = np.full((len(all_gps), a1.shape[1]), np.nan)
+    aligned2 = np.full((len(all_gps), a2.shape[1]), np.nan)
+
+    for idx, pos in enumerate(all_gps):
+        if pos in pos1_to_idx:
+            aligned1[idx, :] = a1[pos1_to_idx[pos], :]
+        if pos in pos2_to_idx:
+            aligned2[idx, :] = a2[pos2_to_idx[pos], :]
+
+    return aligned1, aligned2, all_gps
+
+#4. Predict with pre-trained model
+def predict_association(model, image_loader, device):
+    model.eval()
+    predictions = []
+    with torch.no_grad():
+        for i, (images, _) in enumerate(image_loader):
+            filename, _ = image_loader.dataset.samples[i]
+            images = images.to(device)
+            output = model(images)
+            prob = torch.softmax(output, dim=1)
+            prob_pos = float(prob[0][1])
+            prob_neg = float(prob[0][0])
+            prediction = 'negative'
+
+            if prob_pos > 0.5:
+                prediction = 'positive'
+
+            predictions.append([filename, prediction])
+    return predictions
+
+#5. Methylation fiffcs stats
+def compute_methylation_difference(bam_with, bam_without, mincov=3, mincpgs=3, cpgdist = 50, minlen = 50, mergegap = 100):
+    bam_w, gp1, _ = create_methylation_array(bam_with)
+    bam_wo, gp2, _ = create_methylation_array(bam_without)
+
+    a1, a2, all_gps = align_genomic_pos(bam_w, bam_wo, gp1, gp2)
+    deltas = []
+    site = []
+    for i, pos in enumerate(all_gps):
+        calls_with = a1[i, ~np.isnan(a1[i, :])]
+        calls_wo = a2[i, ~np.isnan(a2[i, :])]
+
+        if len(calls_with) <mincov or len(calls_wo) <mincov:
+            continue
+
+        m_with = int(np.sum(calls_with == 1))
+        u_with = int(np.sum(calls_with == -1))
+        m_wo = int(np.sum(calls_wo == 1))
+        u_wo = int(np.sum(calls_wo == -1))
+
+        reads_with = m_with + u_with
+        reads_wo = m_wo + u_wo
+        if reads_with == 0 or reads_wo == 0:
+            continue
+
+        delta = (m_with/reads_with) - (m_wo/reads_wo)
+
+        deltas.append(delta)
+
+        site.append({'pos':pos+1, 'm_with': m_with, 'u_with': u_with, 'm_wo': m_wo, 'u_wo': u_wo, 'delta': delta})
+    if not site:
+        return []
+
+    deltas = np.asarray(deltas).reshape(-1, 1)
+    gmms = GaussianMixture(n_components=2, reg_covar=1e-4, max_iter=500, random_state=1).fit(deltas)
+    comp_means = gmms.means_.flatten()
+    similar_comp = np.argmin(np.abs(comp_means))
+    diff_comp = 1 - similar_comp
+
+    labels = gmms.predict(deltas)
+    for r, label in zip(site, labels):
+        r['is_diff'] = int(label == diff_comp) #true/1 means there's a diff
+        r['is_sim'] = int(label == similar_comp)
+
+
+    diff_regions = []
+    sim_regions = []
+    cur_dregion, cur_sregion = [site[0]], [site[0]]
+    for prev, curr in zip(site, site[1:]):
+        if curr['pos'] - prev['pos'] <= cpgdist and curr['is_diff']==1 and prev['is_diff'] == 1:
+            cur_dregion.append(curr)
+        else:
+            if len(cur_dregion) >= mincpgs:
+                diff_regions.append(cur_dregion)
+            cur_dregion = [curr]
+
+        if curr['pos'] - prev['pos'] <= 300 and curr['is_sim']==1 and prev['is_sim']==1:
+            cur_sregion.append(curr)
+        else:
+            if len(cur_sregion) >= 10:
+                sim_regions.append(cur_sregion)
+            cur_sregion = [curr]
+
+
+    if len(cur_dregion) >= mincpgs:
+        diff_regions.append(cur_dregion)
+    if len(cur_sregion) >= 10:
+        sim_regions.append(cur_sregion)
+
+    sim_regions  = [r for r in sim_regions  if (r[-1]['pos'] - r[0]['pos']) >= 300]
+
+    if not sim_regions: #checks that difference is localised to spefic regions, not spread across the whole reads (not global)
+        return []
+
+    merged_regions = []
+    if diff_regions:
+        diff_regions = sorted(diff_regions, key=lambda x: x[0]['pos'])
+        cur = diff_regions[0]
+        for nxt in diff_regions[1:]:
+            gap = nxt[0]['pos'] - cur[-1]['pos']
+            block_merge = False
+            for s in sim_regions:
+                if s[0]['pos'] <= nxt[0]['pos'] - 1 and s[-1]['pos'] >= cur[-1]['pos'] + 1: #overlapping similar regions
+                    block_merge = True
+                    break
+            if gap <= mergegap and not block_merge: #merging close regions
+                cur.extend(nxt)
+            else:
+                merged_regions.append(cur)
+                cur = nxt
+        merged_regions.append(cur)
+    else:
+        merged_regions = []
+
+    merged_regions = [r for r in merged_regions if (r[-1]['pos'] - r[0]['pos']) >= minlen]
+
+    results = []
+    for region in merged_regions:
+        start, end = region[0]['pos'], region[-1]['pos']
+        m_with = sum(r['m_with'] for r in region)
+        u_with = sum(r['u_with'] for r in region)
+        m_wo = sum(r['m_wo'] for r in region)
+        u_wo = sum(r['u_wo'] for r in region)
+
+        table = np.array([[m_with, u_with], [m_wo, u_wo]])
+        _, pval = fisher_exact(table, alternative='two-sided')
+
+        results.append({'start': start, 'end': end, 'delta_mean': np.mean([r['delta'] for r in region]), 'pval': pval})
+    if not results:
+        return []
+    pvals = np.array([x['pval'] for x in results])
+    _, pval_corr, _, _ = multitest.multipletests(pvals, method='fdr_bh')
+
+    for i, rs in enumerate(results):
+        rs['pval_adj'] = float(pval_corr[i])
+
+    return results
+
+#6. Generate output file
+def generate_output(predictions, dir, output_file, fdrpval=0.05, diffthresh=0.2):
+    output_list = []
+
+    for prediction in predictions:
+        filename, pred_label = prediction
+
+        parts = os.path.basename(filename).split('_')
+        chrom, start, end, ref, alts = parts[0], parts[1], parts[2], parts[3], parts[4]
+
+        fn = os.path.basename(filename).replace("_comparison.png", ".bam")
+        bam_with = os.path.join(dir, fn)
+        bam_without = bam_with.replace("_with_variant_sorted.bam", "_without_variant_sorted.bam")
+        if not os.path.exists(bam_without):
+            logger.warning(f"Missing paired bam file: {bam_without}")
+            continue
+        reads_alt = sum(1 for _ in pysam.AlignmentFile(bam_with, 'rb'))
+        reads_ref = sum(1 for _ in pysam.AlignmentFile(bam_without, 'rb'))
+
+        change_meth = compute_methylation_difference(bam_with, bam_without, mincov=args.mincov, mincpgs=args.mincpgs, cpgdist=args.cpgdist, minlen=args.minlen, mergegap=args.mergegap)
+
+        if not change_meth:
+            affected_regions = "NA"
+            delta = "NA"
+            pval_min = "NA"
+            class_stats = False
+        else:
+            ranked = sorted(change_meth, key=lambda r: (r['pval_adj'], r['pval']))
+            top5 = ranked[:5]
+            pvals = [r['pval_adj'] for r in top5]
+            affected_regions = ";".join(f"{r['start']}-{r['end']}={r['pval_adj']:.3e}" for r in top5)
+            delta = ";".join(f"{r['delta_mean']:.3f}" for r in top5)
+            best = min(top5, key=lambda r: r['pval_adj'])
+            pval_min = best['pval_adj']
+            delta_p = best['delta_mean']
+            class_stats = round(pval_min, 2) < fdrpval and abs(delta_p) > diffthresh
+
+        association = 'Negative'
+        if class_stats == True and pred_label == 'positive':
+            association = 'Positive'
+
+        output_list.append([chrom, start, end, ref, alts, reads_ref, reads_alt, association, affected_regions, delta, pval_min])
+
+    df = pd.DataFrame(output_list, columns=['Chr', 'Start', 'End', 'Ref', 'Alt', 'Reads_with_Ref', 'Reads_with_Alt', 'Prediction', 'Top 5 DMHs',  'Meth-prop-diffcs', 'min-pval'])
+    pred_order = ['Positive', 'Negative', 'amb']
+    df['Prediction'] = pd.Categorical(df['Prediction'], categories=pred_order, ordered=True)
+    df = df.sort_values(by=['Prediction', 'min-pval'], ascending=[True, True])
+    df = df.drop(columns=['min-pval'])
+
+    df.to_csv(output_file, sep='\t', index=False)
+
+# Main Function
+def main(args):
+    # Create temporary directory
+    tmp_dir = os.path.join("/tmp", str(uuid4()))
+    os.makedirs(tmp_dir, exist_ok=True)
+    img_dir = os.path.join(tmp_dir, "unknown")
+    os.makedirs(img_dir)
+
+    model_path = args.model
+    model = Net(224, num_layers=4)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.to(device)
+    model.eval()
+    logger.info("torch device: %s" % device)
+
+    # Separate reads by variant
+    separate_reads_by_variant(args.bam_file, args.vcf_file, tmp_dir)
+
+    # Index BAM files
+    index_bam_files(tmp_dir)
+
+    # Process and predict associations
+    image_paths = []
+    logger.info("Creating methylation arrays and images")
+    for bam_file in os.listdir(tmp_dir):
+        if bam_file.endswith("_with_variant_sorted.bam"):
+            without_variant_file = bam_file.replace("_with_variant_sorted.bam", "_without_variant_sorted.bam")
+            if os.path.exists(os.path.join(tmp_dir, without_variant_file)):
+                # Generate methylation arrays
+                meth_array1, pos1, _ = create_methylation_array(os.path.join(tmp_dir, bam_file), meth_cutoff=args.meth_cutoff, unmeth_cutoff=args.unmeth_cutoff)
+                meth_array2, pos2, _ = create_methylation_array(os.path.join(tmp_dir, without_variant_file), meth_cutoff=args.meth_cutoff, unmeth_cutoff=args.unmeth_cutoff)
+
+                if meth_array1 is not None and meth_array2 is not None:
+                    # Create image and add to list
+                    img_path = create_methylation_image(meth_array1, meth_array2, pos1, pos2, bam_file, img_dir)
+                    if img_path:
+                        image_paths.append(img_path)
+
+    # Load images and make predictions
+    transform = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor()])
+    image_dataset = ImageFolder(tmp_dir, transform=transform)
+    image_loader = DataLoader(image_dataset, batch_size=1, shuffle=False)
+    logger.info(f"Making predictions...\n")
+    predictions = predict_association(model, image_loader, torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+
+    # Parse SNP data and generate output
+    output_file = f'{os.path.splitext(args.vcf_file)[0]}_output.tsv'
+    generate_output(predictions, tmp_dir, output_file, fdrpval=args.fdrpval, diffthresh=args.diffthresh)
+
+    # Clean up temporary directory
+    subprocess.run(["rm", "-rf", tmp_dir])
+    logger.info(f"Results saved to {output_file}")
+
+# Argument Parsing
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Predict SNV associations with methylation using a pre-trained model.")
+
+    parser.add_argument("-b", "--bam_file", help="Input BAM file", required=True)
+    parser.add_argument("-v", "--vcf_file", help="Input VCF file", required=True)
+    parser.add_argument("-c", "--chromosome", help="Limit analysis to a specific chromosome; must be chr3 instead of 3", required=False)
+    parser.add_argument("-r", "--region", help="Limit analysis to a specific region in chr:start-end format; chr1:100-200", required=False)
+    parser.add_argument("--meth_cutoff", type=float, default=0.8, help="threshold above which a base is considered methylated (default=0.8)")
+    parser.add_argument("--unmeth_cutoff", type=float, default=0.2, help="threshold below which a base is considered unmethylated (default=0.2)")
+    parser.add_argument("--mincpgs", type=int, default=3, help="minimum CpGs to consider before defining a region of potential difference (default=3). Can be up to 10")
+    parser.add_argument("--cpgdist", type=int, default=50, help="maximum distance between consecutive CpGs in a differential region (default=50)")
+    parser.add_argument("--mergegap", type=int, default=100, help="maximum distance between two identified differential region to merge as one (default=100)")
+    parser.add_argument("--mincov", type=int, default=3, help="minimum number of reads with for a genomic position to be considered for methylation estimation (default=3)")
+    parser.add_argument("--minlen", type=int, default=50, help="minimum length of differential region")
+    parser.add_argument("--diffthresh", type=float, default=0.2, help="threshold above which methylation proportion difference is considered big enough (default=0.2)")
+    parser.add_argument("--fdrpval", type=float, default=0.05, help="significance cut-off for methylation difference calculated with fisher's test default(0.05)")
+    parser.add_argument("--model", help="pre-trained model; default in model folder")
+
+    args=parser.parse_args()
+    main(args)
+
