@@ -551,7 +551,7 @@ def main(args):
     predictions = predict_association(model, image_loader, torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
     # Parse SNP data and generate output
-    output_file = f'{os.path.splitext(args.vcf_file)[0]}_output.tsv'
+    output_file = f'{os.path.splitext(os.path.basename(args.vcf_file))[0]}_output.tsv'
     generate_output(predictions, tmp_dir, output_file, fdrpval=args.fdrpval, diffthresh=args.diffthresh)
 
     # Clean up temporary directory

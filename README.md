@@ -74,7 +74,7 @@ unduliner -h
 ## **Example command**
 
 ```bash
-unduliner -b tumor_nanopore.bam -v somatic_calls.vcf --model model/pretrained96.pth --mincov 5 --mincpgs 10 
+unduliner -b tumor_nanopore.bam -v somatic_calls.vcf.gz --model model/pretrained96.pth --mincov 5 --mincpgs 10 
 ```
 
 ---

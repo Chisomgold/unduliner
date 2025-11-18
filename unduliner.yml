@@ -1,0 +1,20 @@
+name: unduliner
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.10
+  - numpy
+  - pandas
+  - matplotlib
+  - pysam
+  - pytorch
+  - torchvision
+  - scipy
+  - seaborn
+  - scikit-learn
+  - statsmodels
+  - joblib
+  - samtools
+  - bx-python
+  - pillow
