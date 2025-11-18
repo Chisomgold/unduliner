@@ -575,7 +575,7 @@ if __name__ == "__main__":
     parser.add_argument("--minlen", type=int, default=50, help="minimum length of differential region")
     parser.add_argument("--diffthresh", type=float, default=0.2, help="threshold above which methylation proportion difference is considered big enough (default=0.2)")
     parser.add_argument("--fdrpval", type=float, default=0.05, help="significance cut-off for methylation difference calculated with fisher's test default(0.05)")
-    parser.add_argument("--model", help="pre-trained model; default in model folder")
+    parser.add_argument("--model", help="pre-trained model; default in model folder", required=True)
 
     args=parser.parse_args()
     main(args)
