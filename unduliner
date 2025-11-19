@@ -493,11 +493,15 @@ def generate_output(predictions, dir, output_file, fdrpval=0.05, diffthresh=0.2)
         association = 'Negative'
         if class_stats == True and pred_label == 'positive':
             association = 'Positive'
+        if class_stats == True and pred_label == 'negative':
+            association = 'Amb'
+        if class_stats == False and pred_label == 'positive':
+             association = 'Amb'
 
         output_list.append([chrom, start, end, ref, alts, reads_ref, reads_alt, association, affected_regions, delta, pval_min])
 
     df = pd.DataFrame(output_list, columns=['Chr', 'Start', 'End', 'Ref', 'Alt', 'Reads_with_Ref', 'Reads_with_Alt', 'Prediction', 'Top 5 DMHs',  'Meth-prop-diffcs', 'min-pval'])
-    pred_order = ['Positive', 'Negative', 'amb']
+    pred_order = ['Positive', 'Negative', 'Amb']
     df['Prediction'] = pd.Categorical(df['Prediction'], categories=pred_order, ordered=True)
     df = df.sort_values(by=['Prediction', 'min-pval'], ascending=[True, True])
     df = df.drop(columns=['min-pval'])
