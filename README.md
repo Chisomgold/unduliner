@@ -74,7 +74,7 @@ unduliner -h
 ## **Example command**
 
 ```bash
-unduliner -b tumor_nanopore.bam -v somatic_calls.vcf.gz --model model/pretrained96.pth --mincov 5 --mincpgs 10 
+unduliner -b testdata/chr4atcc.bam -v chr4atcc.vcf.gz --model model/pretrained80.pth --mincov 5 --mincpgs 10 
 ```
 
 ---
@@ -98,7 +98,7 @@ unduliner -b tumor_nanopore.bam -v somatic_calls.vcf.gz --model model/pretrained
 ### Column descriptions
 
 * **Prediction:** “Positive” = variant likely associated with nearby methylation change
-* **Top 5 DMHs:** Genomic intervals with smallest adjusted p-values
+* **Top 5 DMHs:** <= 5 Genomic intervals with smallest adjusted p-values
 * **Meth-prop-diffs:** Δ(methylation) between ref-allele reads and alt-allele reads, where a negative value means reduced methylation on the variant reads compared to the reference.
 * **Start/End:** The SNV genomic coordinate (End = variant position)
 
