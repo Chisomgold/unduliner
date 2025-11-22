@@ -336,7 +336,7 @@ def predict_association(model, image_loader, device):
     return predictions
 
 #5. Methylation fiffcs stats
-def compute_methylation_difference(bam_with, bam_without, mincov=3, mincpgs=3, cpgdist = 50, minlen = 50, mergegap = 100):
+def compute_methylation_difference(bam_with, bam_without, mincov=3, mincpgs=3, cpgdist = 50, minlen = 50, mergegap = 100, diffthresh=0.2):
     bam_w, gp1, _ = create_methylation_array(bam_with)
     bam_wo, gp2, _ = create_methylation_array(bam_without)
 
@@ -369,16 +369,20 @@ def compute_methylation_difference(bam_with, bam_without, mincov=3, mincpgs=3, c
         return []
 
     deltas = np.asarray(deltas).reshape(-1, 1)
-    gmms = GaussianMixture(n_components=2, reg_covar=1e-4, max_iter=500, random_state=1).fit(deltas)
-    comp_means = gmms.means_.flatten()
-    similar_comp = np.argmin(np.abs(comp_means))
-    diff_comp = 1 - similar_comp
+    if len(deltas) < 2:
+        for r in site:
+            r['is_diff'] = int(abs(r['delta']) > diffthresh)
+            r['is_sim'] = int(abs(r['delta']) <= diffthresh)
+    else:
+        gmms = GaussianMixture(n_components=2, reg_covar=1e-4, max_iter=500, random_state=1).fit(deltas)
+        comp_means = gmms.means_.flatten()
+        similar_comp = np.argmin(np.abs(comp_means))
+        diff_comp = 1 - similar_comp
 
-    labels = gmms.predict(deltas)
-    for r, label in zip(site, labels):
-        r['is_diff'] = int(label == diff_comp) #true/1 means there's a diff
-        r['is_sim'] = int(label == similar_comp)
-
+        labels = gmms.predict(deltas)
+        for r, label in zip(site, labels):
+            r['is_diff'] = int(label == diff_comp) #true/1 means there's a diff
+            r['is_sim'] = int(label == similar_comp)
 
     diff_regions = []
     sim_regions = []
@@ -406,7 +410,7 @@ def compute_methylation_difference(bam_with, bam_without, mincov=3, mincpgs=3, c
 
     sim_regions  = [r for r in sim_regions  if (r[-1]['pos'] - r[0]['pos']) >= 300]
 
-    if not sim_regions: #checks that difference is localised to spefic regions, not spread across the whole reads (not global)
+    if not sim_regions: #checks that difference is localised to specific regions, not spread across the whole reads (not global)
         return []
 
     merged_regions = []
@@ -472,7 +476,7 @@ def generate_output(predictions, dir, output_file, fdrpval=0.05, diffthresh=0.2)
         reads_alt = sum(1 for _ in pysam.AlignmentFile(bam_with, 'rb'))
         reads_ref = sum(1 for _ in pysam.AlignmentFile(bam_without, 'rb'))
 
-        change_meth = compute_methylation_difference(bam_with, bam_without, mincov=args.mincov, mincpgs=args.mincpgs, cpgdist=args.cpgdist, minlen=args.minlen, mergegap=args.mergegap)
+        change_meth = compute_methylation_difference(bam_with, bam_without, mincov=args.mincov, mincpgs=args.mincpgs, cpgdist=args.cpgdist, minlen=args.minlen, mergegap=args.mergegap, diffthresh=args.diffthresh)
 
         if not change_meth:
             affected_regions = "NA"
@@ -494,7 +498,7 @@ def generate_output(predictions, dir, output_file, fdrpval=0.05, diffthresh=0.2)
         if class_stats == True and pred_label == 'positive':
             association = 'Positive'
         if class_stats == True and pred_label == 'negative':
-            association = 'Amb'
+            association = 'Positive'
         if class_stats == False and pred_label == 'positive':
              association = 'Amb'
 
