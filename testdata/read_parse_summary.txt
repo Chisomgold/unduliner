@@ -1,0 +1,7 @@
+Skipped the following positions because at least one BAM was empty:
+
+No ALT-supporting reads for:
+chr17:21043316-21043317 REF=G ALT=C
+chr17:21596010-21596011 REF=G ALT=A
+chr17:21596616-21596617 REF=A ALT=G
+chr17:22487939-22487940 REF=C ALT=G

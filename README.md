@@ -74,7 +74,7 @@ unduliner -h
 ## **Example command**
 
 ```bash
-unduliner -b testdata/chr4atcc.bam -v chr4atcc.vcf.gz --model model/pretrained80.pth --mincov 5 --mincpgs 10 
+unduliner -b testdata/chr17_2M_225M.bam -v testdata/chr17atcc.vcf.gz --model model/pretrained80.pth --mincov 5 --mincpgs 10 
 ```
 
 ---
