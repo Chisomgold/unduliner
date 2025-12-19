@@ -22,6 +22,8 @@ import csv
 import subprocess
 from uuid import uuid4
 import pandas as pd
+from collections import defaultdict as dd
+from bx.intervals.intersection import Intersecter, Interval
 from scipy.stats import ttest_ind, fisher_exact
 from statsmodels.stats import multitest
 from statsmodels.stats.proportion import proportions_ztest
@@ -104,7 +106,6 @@ def separate_reads_by_variant(bam_file, vcf_file, output_dir):
         with_variant = pysam.AlignmentFile(f'{output_dir}/{chrom}_{start}_{end}_{ref}_{alt}_with_variant.bam', 'wb', template=bam)
         without_variant = pysam.AlignmentFile(f'{output_dir}/{chrom}_{start}_{end}_{ref}_{alt}_without_variant.bam', 'wb', template=bam)
 
-        logger.info(f"Processing VCF record: {record.chrom}:{record.pos}, REF: {record.ref}, ALT: {record.alts[0]}")
         variant_count += 1
 
         reads = bam.fetch(chrom, start, end)
@@ -143,6 +144,9 @@ def separate_reads_by_variant(bam_file, vcf_file, output_dir):
             os.remove(f'{output_dir}/{chrom}_{start}_{end}_{ref}_{alt}_without_variant.bam')
             continue
 
+        if variant_count % 100 == 0:
+            logger.info(f"Processed {variant_count} variants...")
+
         with_variant.close()
         without_variant.close()
 
@@ -162,7 +166,7 @@ def separate_reads_by_variant(bam_file, vcf_file, output_dir):
                 for chrom, start, end, ref, alt in empty_bams["ref"]:
                     report.write(f"{chrom}:{start}-{end} REF={ref} ALT={alt}\n")
 
-    logger.info(f"Processed {variant_count} variants")
+    logger.info(f"Processed a total of {variant_count} variants")
     bam.close()
     vcf_reader.close()
 
@@ -336,7 +340,7 @@ def predict_association(model, image_loader, device):
             predictions.append([filename, prediction])
     return predictions
 
-#5. Methylation fiffcs stats
+#5. Methylation diffcs stats
 def compute_methylation_difference(bam_with, bam_without, mincov=3, mincpgs=3, cpgdist = 50, minlen = 50, mergegap = 100, diffthresh=0.2):
     bam_w, gp1, _ = create_methylation_array(bam_with)
     bam_wo, gp2, _ = create_methylation_array(bam_without)
@@ -458,9 +462,142 @@ def compute_methylation_difference(bam_with, bam_without, mincov=3, mincpgs=3, c
 
     return results
 
+#GTF anno
+
+def build_gtf_interval(gtf_file):
+    intervals = dd(Intersecter)
+
+    gtf = pysam.TabixFile(gtf_file)
+    for line in gtf.fetch():
+        if line.startswith('#'):
+            continue
+        chrom, source, feature, start, end, score, strand, frame, attributes = line.split('\t')
+
+        if "chr" not in chrom:
+            chrom = "chr" + chrom
+        start, end = int(start), int(end)
+        attr_dict = {}
+        for attr in attributes.strip().split(';'):
+            if attr:
+                key, val = attr.strip().split()[:2]
+                key = key.strip()
+                val = val.strip().strip('"')
+                attr_dict[key] = val
+        possible_ids = [f'{feature}_id', 'ccds_id']
+        feature_id = 'NA'
+        for fid in possible_ids:
+            if fid in attr_dict:
+                feature_id = attr_dict[fid]
+                break
+
+        if 'gene_id' not in attr_dict:
+            continue
+        if 'gene_name' not in attr_dict:
+            attr_dict['gene_name'] = attr_dict['gene_id']
+        gene_name = attr_dict['gene_name']
+
+        interval = Interval(start, end, value=(feature, gene_name, feature_id))
+        intervals[chrom].add_interval(interval)
+    return intervals
+
+def annotate_gtf(chrom, region_string, intervals):
+    feature_priority=['exon', 'CDS', 'transcript', 'gene']
+
+    annotations = []
+    if not region_string or region_string == 'NA':
+        return 'NA'
+
+    regions = region_string.split(';')
+
+    for region in regions:
+        if '=' in region:
+            coord, _ = region.split('=')
+        else:
+            continue
+
+        start, end = map(int, coord.split('-'))
+
+        annotation = []
+        if chrom in intervals:
+            for rec in intervals[chrom].find(start, end):
+                annotation.append(rec.value)
+        if not annotation:
+            annotations.append('NA')
+            continue
+        if len(annotation) == 1:
+            annotations.append(','.join(annotation[0]))
+            continue
+
+        #multiple feature hits
+        fp = None
+        for feature in feature_priority:
+            for a in annotation:
+                if a[0] == feature:
+                    fp = a
+                    break
+            if fp:
+                break
+        if not fp:
+            annotations.append(','.join(annotation[0]))
+        else:
+            annotations.append(','.join(fp))
+
+    return ';'.join(annotations)
+
+
+# CRE anno
+def build_CRE_interval(cre_file):
+    intervals = dd(Intersecter)
+
+    with open(cre_file) as f:
+        for line in f:
+            chrom, start, end, name = line.strip().split()[:4]
+
+            if not chrom.startswith('chr'):
+                chrom = 'chr' + chrom
+
+            start, end = int(start), int(end)
+
+            intervals[chrom].add_interval(Interval(start, end, value=name))
+
+    return intervals
+
+def annotate_CRE(chrom, region_string, cre_intervals):
+    if region_string == 'NA':
+        return 'NA'
+
+    regions = region_string.split(";")
+    annotations = []
+
+    for region in regions:
+        if not region:
+            annotations.append('NA')
+
+        if '=' in region:
+            coord, _ = region.split('=')
+        else:
+            annotations.append('NA')
+
+        start, end = map(int, coord.split('-'))
+
+        hits = []
+        if chrom in cre_intervals:
+            for rec in cre_intervals[chrom].find(start, end):
+                hits.append(rec.value)
+
+        if hits:
+            annotations.append(','.join(hits))
+        else:
+            annotations.append('NA')
+
+    return ";".join(annotations)
+
+
 #6. Generate output file
 def generate_output(predictions, dir, output_file, fdrpval=0.05, diffthresh=0.2):
     output_list = []
+    gtf_annotations = []
+    cre_annotations = []
 
     for prediction in predictions:
         filename, pred_label = prediction
@@ -506,6 +643,24 @@ def generate_output(predictions, dir, output_file, fdrpval=0.05, diffthresh=0.2)
         output_list.append([chrom, start, end, ref, alts, reads_ref, reads_alt, association, affected_regions, delta, pval_min])
 
     df = pd.DataFrame(output_list, columns=['Chr', 'Start', 'End', 'Ref', 'Alt', 'Reads_with_Ref', 'Reads_with_Alt', 'Prediction', 'Top 5 DMHs',  'Meth-prop-diffcs', 'min-pval'])
+
+    if args.gtf:
+        gtf_intervals = build_gtf_interval(args.gtf)
+        for row in output_list:
+            chrom, start, end, ref, alts, reads_ref, reads_alt, pred, regions, delta, pval = row
+            gtf_annot = annotate_gtf(chrom, regions, gtf_intervals)
+            gtf_annotations.append(gtf_annot)
+        df["GTF annotation"] = gtf_annotations
+
+    if args.cre:
+        cre_intervals = build_CRE_interval(args.cre)
+        for row in output_list:
+            chrom, start, end, ref, alts, reads_ref, reads_alt, pred, regions, delta, pval = row
+            cre_annot = annotate_CRE(chrom, regions, cre_intervals)
+            cre_annotations.append(cre_annot)
+        df["CRE annotation"] = cre_annotations
+
+
     pred_order = ['Positive', 'Negative', 'Amb']
     df['Prediction'] = pd.Categorical(df['Prediction'], categories=pred_order, ordered=True)
     df = df.sort_values(by=['Prediction', 'min-pval'], ascending=[True, True])
@@ -516,7 +671,7 @@ def generate_output(predictions, dir, output_file, fdrpval=0.05, diffthresh=0.2)
 # Main Function
 def main(args):
     # Create temporary directory
-    tmp_dir = os.path.join("/tmp", str(uuid4()))
+    tmp_dir = os.path.join(args.tmp, str(uuid4()))
     os.makedirs(tmp_dir, exist_ok=True)
     img_dir = os.path.join(tmp_dir, "unknown")
     os.makedirs(img_dir)
@@ -585,6 +740,9 @@ if __name__ == "__main__":
     parser.add_argument("--diffthresh", type=float, default=0.2, help="threshold above which methylation proportion difference is considered big enough (default=0.2)")
     parser.add_argument("--fdrpval", type=float, default=0.05, help="significance cut-off for methylation difference calculated with fisher's test default(0.05)")
     parser.add_argument("--model", help="pre-trained model; default in model folder", required=True)
+    parser.add_argument("--tmp", help="temp folder that supports writing of thousands of files, depending on variant size", default="/tmp", required=False)
+    parser.add_argument("--gtf", help="tabix-indexed gtf file", required=False)
+    parser.add_argument("--cre", help="file with CREs, promoters, enhancers, etc. No header row", required=False)
 
     args=parser.parse_args()
     main(args)
