@@ -68,7 +68,8 @@ unduliner -h
 | `--cpgdist`       | 50                    | Maximum distance allowed between consecutive CpGs |
 | `--meth_cutoff`   | 0.8                    | Probability threshold for calling methylated      |
 | `--unmeth_cutoff` | 0.2                    | Probability threshold for calling unmethylated    |
-
+| `--gtf`           | -                      | GTF file to annotated diff methylated regions     |
+| `--cre`           | -                      | CRE file for annotation                           |
 ---
 
 ## **Example command**
