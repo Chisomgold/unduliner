@@ -2,6 +2,7 @@
 
 import os
 import numpy as np
+import re
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 from PIL import Image
@@ -69,7 +70,7 @@ class Net(nn.Module):
 
         return seq_block
 
-#1: Separate reads by variant
+#1: Separate reads by SNV
 def separate_reads_by_variant(bam_file, vcf_file, output_dir):
     logger.info("reading input files")
     bam = pysam.AlignmentFile(bam_file, 'rb')
@@ -106,8 +107,6 @@ def separate_reads_by_variant(bam_file, vcf_file, output_dir):
         with_variant = pysam.AlignmentFile(f'{output_dir}/{chrom}_{start}_{end}_{ref}_{alt}_with_variant.bam', 'wb', template=bam)
         without_variant = pysam.AlignmentFile(f'{output_dir}/{chrom}_{start}_{end}_{ref}_{alt}_without_variant.bam', 'wb', template=bam)
 
-        variant_count += 1
-
         reads = bam.fetch(chrom, start, end)
         read_list = list(reads)
 
@@ -133,18 +132,19 @@ def separate_reads_by_variant(bam_file, vcf_file, output_dir):
         if not wrote_alt or not wrote_ref:
             if not wrote_alt:
                 empty_bams["alt"].append((chrom, start, end, ref, alt))
-                variant_count -= 1
+
             if not wrote_ref:
                 empty_bams["ref"].append((chrom, start, end, ref, alt))
-                variant_count -= 1
 
             with_variant.close()
             without_variant.close()
             os.remove(f'{output_dir}/{chrom}_{start}_{end}_{ref}_{alt}_with_variant.bam')
             os.remove(f'{output_dir}/{chrom}_{start}_{end}_{ref}_{alt}_without_variant.bam')
             continue
+        else:
+            variant_count += 1
 
-        if variant_count % 100 == 0:
+        if variant_count % 100 == 0 and variant_count != 0:
             logger.info(f"Processed {variant_count} variants...")
 
         with_variant.close()
@@ -170,6 +170,182 @@ def separate_reads_by_variant(bam_file, vcf_file, output_dir):
     bam.close()
     vcf_reader.close()
 
+#SV H:
+def read_supports_INS(read, pos, svlen):
+    ref_pos = read.reference_start
+    for op, length in read.cigartuples:
+        if op in (0, 2, 3, 7, 8): #consume ref
+            ref_pos += length
+        elif op == 1:
+            if abs(ref_pos - pos) <= 1:
+                if abs(length - svlen) <= 10:
+                    return True
+        elif op in (4, 5):
+            pass
+
+    return False
+
+def read_supports_DEL(read, pos, svlen):
+    ref_pos = read.reference_start
+    for op, length in read.cigartuples:
+        if op == 2:
+            if abs(ref_pos - pos) <= 1:
+                if abs(length - svlen) <= 10:
+                    return True
+            else:
+                ref_pos += length
+        elif op in (0, 3, 7, 8):
+            ref_pos += length
+        else:
+            pass
+
+    return False
+
+def parse_bnd_alt(alt):
+    bnd = re.search(r'[\[\]]([^:\[\]]+):(\d+)[\[\]]', alt.replace(" ", ""))
+    if not bnd:
+        return None, None
+    return bnd.group(1), int(bnd.group(2))
+
+def read_supports_BND(read, chrom, pos, alt):
+    partner_chrom, partner_pos = parse_bnd_alt(alt)
+    if partner_chrom is None:
+        return False
+
+    #BND would be at the start/end of the primary read
+    if not (abs(read.reference_start  - pos) <= 10 or abs(read.reference_end - pos) <= 10):
+        return False
+
+    def norm(c):
+        return c if c.startswith("chr") else "chr" + c
+
+    chrom = norm(chrom)
+    partner_chrom = norm(partner_chrom)
+
+    primary = (read.reference_name == chrom)
+
+    if read.has_tag("SA"):
+        for aln in read.get_tag("SA").split(";"):
+            if not aln:
+                continue
+            c, p = aln.split(",")[0:2]
+            c = norm(c)
+            if c == partner_chrom and abs(int(p) - partner_pos) <= 10:
+                return True
+
+    return False
+
+#2: Separate reads by SV
+def separate_reads_by_sv(bam_file, vcf_file, output_dir):
+    logger.info("reading input files")
+    bam = pysam.AlignmentFile(bam_file, 'rb')
+    vcf_reader = pysam.VariantFile(vcf_file)
+
+    sv_count = 0
+    empty_bams = {"alt": [], "ref": []}
+
+    region_chrom = None
+    region_start = None
+    region_end = None
+
+    if args.chromosome:
+        region_chrom = args.chromosome
+
+    if args.region:
+        region_chrom, coords = args.region.split(':')
+        region_start, region_end = map(int, coords.split('-'))
+
+    for record in vcf_reader.fetch():
+        svtype = record.info['SVTYPE']
+        chrom = record.chrom
+        start = record.pos - 1
+        ref = record.ref
+        alt = record.alts[0]
+        end = record.stop
+        svlen = abs(record.info.get("SVLEN", end - start))
+
+        if region_chrom and chrom != region_chrom:
+            continue
+
+        if region_start and region_end and (start < region_start or end > region_end):
+            continue
+
+        with_variant = pysam.AlignmentFile(f'{output_dir}/{chrom}_{start}_{end}_{ref}_{svtype}_with_variant.bam', 'wb', template=bam)
+        without_variant = pysam.AlignmentFile(f'{output_dir}/{chrom}_{start}_{end}_{ref}_{svtype}_without_variant.bam', 'wb', template=bam)
+
+        reads = bam.fetch(chrom, start, end)
+
+        wrote_alt = False
+        wrote_ref = False
+
+        for read in reads:
+            if read.query_sequence is None:
+                continue
+
+            if svtype == "INS":
+                supports = read_supports_INS(read, start, svlen)
+
+            elif svtype == "DEL":
+                supports = read_supports_DEL(read, start, svlen)
+
+            elif svtype == "BND":
+                supports = read_supports_BND(read, chrom, start, alt)
+
+            else:
+                continue
+
+            if supports:
+                with_variant.write(read)
+                wrote_alt = True
+                logger.debug(f"wrote {read.query_name} to with_variant")
+
+            else:
+                without_variant.write(read)
+                wrote_ref = True
+                logger.debug(f"wrote {read.query_name} to without_variant")
+
+        if not wrote_alt or not wrote_ref:
+            if not wrote_alt:
+                empty_bams["alt"].append((chrom, start, end, svtype))
+
+            if not wrote_ref:
+                empty_bams["ref"].append((chrom, start, end, svtype))
+
+            with_variant.close()
+            without_variant.close()
+            os.remove(f'{output_dir}/{chrom}_{start}_{end}_{ref}_{svtype}_with_variant.bam')
+            os.remove(f'{output_dir}/{chrom}_{start}_{end}_{ref}_{svtype}_without_variant.bam')
+            continue
+        else:
+            sv_count += 1
+
+        if sv_count % 100 == 0 and sv_count != 0:
+            logger.info(f"Processed {sv_count} variants...")
+
+        with_variant.close()
+        without_variant.close()
+
+    report_path = "read_parse_summary.txt"
+
+    if empty_bams["alt"] or empty_bams["ref"]:
+        with open(report_path, "w") as report:
+            report.write("Skipped the following positions because at least one BAM was empty:\n")
+
+            if empty_bams["alt"]:
+                report.write("\nNo ALT-supporting reads for:\n")
+                for chrom, start, end, svtype in empty_bams["alt"]:
+                    report.write(f"{chrom}:{start}-{end};{svtype}\n")
+
+            if empty_bams["ref"]:
+                report.write("\nNo REF-supporting reads for:\n")
+                for chrom, start, end, svtype in empty_bams["ref"]:
+                    report.write(f"{chrom}:{start}-{end};{svtype}\n")
+
+    logger.info(f"Processed a total of {sv_count} variants")
+
+    bam.close()
+    vcf_reader.close()
+
 #H: index BAM files
 def index_bam_files(output_dir):
     logger.info("Indexing bam files")
@@ -182,7 +358,7 @@ def index_bam_files(output_dir):
                 subprocess.run(["samtools", "sort", "-o", sorted_bam, bam_file_path])
             subprocess.run(["samtools", "index", sorted_bam])
 
-#2. Extract methylation data
+#3. Extract methylation data
 def create_methylation_array(bam_path, meth_cutoff=0.8, unmeth_cutoff=0.2):
     bam = pysam.AlignmentFile(bam_path, "rb")
     methylation_data = {}
@@ -217,7 +393,7 @@ def create_methylation_array(bam_path, meth_cutoff=0.8, unmeth_cutoff=0.2):
 
     return methylation_array, genomic_positions, read_ids
 
-#3. Create Methylation Images
+#4. Create Methylation Images
 def create_methylation_image(methylation_array1, methylation_array2, genomic_positions1, genomic_positions2, bam_filename, output_dir):
     cmap=ListedColormap(['blue', 'grey', 'red']) #blue = -1, red = 1, grey =0 IGV mapping
     region = os.path.splitext(os.path.basename(bam_filename))[0]
@@ -320,7 +496,7 @@ def align_genomic_pos(a1, a2, gp1, gp2):
 
     return aligned1, aligned2, all_gps
 
-#4. Predict with pre-trained model
+#5. Predict with pre-trained model
 def predict_association(model, image_loader, device):
     model.eval()
     predictions = []
@@ -340,7 +516,7 @@ def predict_association(model, image_loader, device):
             predictions.append([filename, prediction])
     return predictions
 
-#5. Methylation diffcs stats
+#6. Methylation diffcs stats
 def compute_methylation_difference(bam_with, bam_without, mincov=3, mincpgs=3, cpgdist = 50, minlen = 50, mergegap = 100, diffthresh=0.2):
     bam_w, gp1, _ = create_methylation_array(bam_with)
     bam_wo, gp2, _ = create_methylation_array(bam_without)
@@ -463,7 +639,6 @@ def compute_methylation_difference(bam_with, bam_without, mincov=3, mincpgs=3, c
     return results
 
 #GTF anno
-
 def build_gtf_interval(gtf_file):
     intervals = dd(Intersecter)
 
@@ -593,7 +768,7 @@ def annotate_CRE(chrom, region_string, cre_intervals):
     return ";".join(annotations)
 
 
-#6. Generate output file
+#7. Generate output file
 def generate_output(predictions, dir, output_file, fdrpval=0.05, diffthresh=0.2):
     output_list = []
     gtf_annotations = []
@@ -647,7 +822,8 @@ def generate_output(predictions, dir, output_file, fdrpval=0.05, diffthresh=0.2)
     if args.gtf:
         gtf_intervals = build_gtf_interval(args.gtf)
         for row in output_list:
-            chrom, start, end, ref, alts, reads_ref, reads_alt, pred, regions, delta, pval = row
+            chrom = row[0] #, start, end, ref, alts, reads_ref, reads_alt, pred, regions, delta, pval = row
+            regions = row[8]
             gtf_annot = annotate_gtf(chrom, regions, gtf_intervals)
             gtf_annotations.append(gtf_annot)
         df["GTF annotation"] = gtf_annotations
@@ -655,7 +831,8 @@ def generate_output(predictions, dir, output_file, fdrpval=0.05, diffthresh=0.2)
     if args.cre:
         cre_intervals = build_CRE_interval(args.cre)
         for row in output_list:
-            chrom, start, end, ref, alts, reads_ref, reads_alt, pred, regions, delta, pval = row
+            chrom = row[0] #, start, end, ref, alts, reads_ref, reads_alt, pred, regions, delta, pval = row
+            region = row[8]
             cre_annot = annotate_CRE(chrom, regions, cre_intervals)
             cre_annotations.append(cre_annot)
         df["CRE annotation"] = cre_annotations
@@ -685,7 +862,10 @@ def main(args):
     logger.info("torch device: %s" % device)
 
     # Separate reads by variant
-    separate_reads_by_variant(args.bam_file, args.vcf_file, tmp_dir)
+    if args.sv:
+        separate_reads_by_sv(args.bam_file, args.vcf_file, tmp_dir)
+    else:
+        separate_reads_by_variant(args.bam_file, args.vcf_file, tmp_dir)
 
     # Index BAM files
     index_bam_files(tmp_dir)
@@ -740,9 +920,10 @@ if __name__ == "__main__":
     parser.add_argument("--diffthresh", type=float, default=0.2, help="threshold above which methylation proportion difference is considered big enough (default=0.2)")
     parser.add_argument("--fdrpval", type=float, default=0.05, help="significance cut-off for methylation difference calculated with fisher's test default(0.05)")
     parser.add_argument("--model", help="pre-trained model; default in model folder", required=True)
-    parser.add_argument("--tmp", help="temp folder that supports writing of thousands of files, depending on variant size", default="/tmp", required=False)
-    parser.add_argument("--gtf", help="tabix-indexed gtf file", required=False)
-    parser.add_argument("--cre", help="file with CREs, promoters, enhancers, etc. No header row", required=False)
+    parser.add_argument("--tmp", help="temp folder that supports writing of thousands of files, depending on variant size", default="/tmp")
+    parser.add_argument("--gtf", help="tabix-indexed gtf file")
+    parser.add_argument("--cre", help="file with CREs, promoters, enhancers, etc. No header row")
+    parser.add_argument("--sv", action="store_true", help="activate function for structural variants")
 
     args=parser.parse_args()
     main(args)
