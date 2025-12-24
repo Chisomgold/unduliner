@@ -1,27 +1,28 @@
 # **unduliner**
 
-### *Predicting methylation-altering single nucleotide variants (SNVs) from Nanopore sequencing*
+### *Predicting methylation-altering single nucleotide variants (SNVs) and structural variants (SVs) from nanopore sequencing*
 
-`unduliner` is a Python package designed to predict whether a somatic single-nucleotide variant is associated with local methylation change, 
-using Nanopore long-read sequencing and a pre-trained deep learning model.
+`unduliner` is a Python package designed to predict whether a somatic variant is associated with local methylation change, 
+using nanopore long-read sequencing and a pre-trained deep learning model.
 
 The tool takes as input:
 
 * One BAM file (Nanopore reads with MM/ML tags)
-* One VCF file (somatic SNVs)
+* One VCF file
 * A trained model (`.pth`, included in the `model/` directory)
 
-It extracts genomic regions around each SNV, evaluates methylation differences using a statistical and deep learning pipeline, and predicts whether 
+It extracts genomic regions around each variants, evaluates methylation differences using a statistical and deep learning pipeline, and predicts whether 
 the variant is likely to cause a methylation shift.
 
 ---
 
 ## **Features**
 
-* Predicts SNV-associated methylation alterations
+* Predicts SNV- and SV-associated methylation alterations
 * Works directly on Nanopore MM/ML–tagged BAMs
 * User-configurable methylation thresholds
 * Outputs an interpretable table including DMR-like regions and methylation deltas
+* Supports GTF and regulatory elements annotation of identified regions
 
 ---
 
@@ -59,19 +60,19 @@ unduliner -h
 
 ### **Some optional arguments**
 
-| Argument          | Default                | Description                                       |
-| ----------------- | ---------------------- | ------------------------------------------------- |
-| `--chromosome`    | -                      | Chromosome of interest (e.g., chr10)              |
-| `--region`        | -                      | Region of interest (e.g. chr10:3000-4000)         |
-| `--mincov`        | 3                      | Minimum read coverage per allele                  |
-| `--mincpgs`       | 3                      | Minimum CpGs required within region               |
-| `--cpgdist`       | 50                    | Maximum distance allowed between consecutive CpGs |
-| `--meth_cutoff`   | 0.8                    | Probability threshold for calling methylated      |
-| `--unmeth_cutoff` | 0.2                    | Probability threshold for calling unmethylated    |
-| `--tmp`           | /tmp                   | Dir that supports read/write of many files        |
-| `--gtf`           | -                      | GTF file to annotated diff methylated regions     |
-| `--cre`           | -                      | CRE file for annotation                           |
-| `--sv`            | -                      | Activates functions for SVs - INS,DEL,BND only    |
+| Argument          | Default                | Description                                                     |
+| ----------------- | ---------------------- | --------------------------------------------------------------  | 
+| `--chromosome`    | -                      | Chromosome of interest (e.g., chr10)                            |
+| `--region`        | -                      | Region of interest (e.g. chr10:3000-4000)                       |
+| `--mincov`        | 3                      | Minimum read coverage per allele                                |
+| `--mincpgs`       | 3                      | Minimum CpGs required within region                             |
+| `--cpgdist`       | 50                     | Maximum distance allowed between consecutive CpGs               |
+| `--meth_cutoff`   | 0.8                    | Probability threshold for calling methylated                    |
+| `--unmeth_cutoff` | 0.2                    | Probability threshold for calling unmethylated                  |
+| `--tmp`           | /tmp                   | Dir that supports read/write of many files                      |
+| `--gtf`           | -                      | Tabix-indexed GTF file to annotated diff methylated regions     |
+| `--cre`           | -                      | CRE file for annotation                                         |
+| `--sv`            | -                      | Activates functions for SVs - INS,DEL,BND only                  |
 ---
 
 ## **Example command**
@@ -79,6 +80,12 @@ unduliner -h
 ```bash
 unduliner -b testdata/chr17_2M_225M.bam -v testdata/chr17atcc.vcf.gz --model model/pretrained80.pth --mincov 5 --mincpgs 10 
 ```
+
+### for SV
+```bash
+unduliner -b sample.bam -v SV.vcf.gz --model model/pretrained80.pth --sv
+```
+
 
 ---
 
@@ -103,6 +110,7 @@ unduliner -b testdata/chr17_2M_225M.bam -v testdata/chr17atcc.vcf.gz --model mod
 * **Top 5 DMHs:** <= 5 Genomic intervals with smallest adjusted p-values
 * **Meth-prop-diffs:** Δ(methylation) between ref-allele reads and alt-allele reads, where a negative value means reduced methylation on the variant reads compared to the reference.
 * **Start/End:** The SNV genomic coordinate (End = variant position)
+* Extra columns for GTF and CREs by user-request
 
 ---
 
