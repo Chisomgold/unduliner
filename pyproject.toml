@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unduliner"
+version = "1.0.0"
+description = "CLI tool to link variants to methylation changes from nanopore data"
+readme = "DESCRIPTION.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Halimat Chisom Atanda", email = "gearthdexter@gmail.com" }
+]
+requires-python = ">=3.10"
+
+dependencies = [
+    "torch",
+    "torch-summary",
+    "torchvision",
+    "matplotlib",
+    "seaborn",
+    "pysam",
+    "bx-python",
+    "scikit-learn",
+    "scipy",
+    "numpy",
+    "pillow"
+]
+
+keywords = ["genomics", "bioinformatics", "dna-methylation", "variant-calling"]
+
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: OS Independent",
+]
+
+[project.scripts]
+unduliner = "unduliner.cli:main"
+
+[tool.setuptools]
+packages = ["unduliner", "unduliner.model"]
+
+[project.urls]
+Source = "https://github.com/Chisomgold/unduliner"
+Documentation = "https://github.com/Chisomgold/unduliner/tree/main#unduliner"

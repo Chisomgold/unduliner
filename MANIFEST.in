@@ -1,0 +1,2 @@
+recursive-include unduliner/model *.pth
+include *.md

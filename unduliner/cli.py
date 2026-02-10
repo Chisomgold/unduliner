@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import os
+import sys
 import numpy as np
 import re
 import matplotlib.pyplot as plt
@@ -18,6 +19,7 @@ from torchvision.datasets import ImageFolder
 import warnings
 warnings.filterwarnings("ignore")
 import pysam
+pysam.set_verbosity(0)
 import argparse
 import csv
 import subprocess
@@ -29,12 +31,18 @@ from scipy.stats import ttest_ind, fisher_exact
 from statsmodels.stats import multitest
 from statsmodels.stats.proportion import proportions_ztest
 from sklearn.mixture import GaussianMixture
+from importlib.resources import files
 
 import logging
 FORMAT = '%(asctime)s %(message)s'
 logging.basicConfig(format=FORMAT)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+def get_model_path():
+    return files("unduliner.model").joinpath("pretrained80.pth")
+
+MODEL_PATH = get_model_path()
 
 # Define architecture
 class Net(nn.Module):
@@ -71,7 +79,7 @@ class Net(nn.Module):
         return seq_block
 
 #1: Separate reads by SNV
-def separate_reads_by_variant(bam_file, vcf_file, output_dir):
+def separate_reads_by_variant(bam_file, vcf_file, output_dir, args):
     logger.info("reading input files")
     bam = pysam.AlignmentFile(bam_file, 'rb')
     vcf_reader = pysam.VariantFile(vcf_file)
@@ -235,8 +243,54 @@ def read_supports_BND(read, chrom, pos, alt):
 
     return False
 
+def refspan(cigar):
+    span = 0
+    for length, op in re.findall(r'(\d+)([MIDNSHP=X])', cigar):
+        length = int(length)
+        if op in ("M", "D", "=", "X"):
+            span += length
+    return span
+
+
+def read_supports_INV(read, chrom, end):
+    if not read.has_tag("SA"):
+        return False
+
+    if read.reference_name != chrom:
+        return False
+    for aln in read.get_tag("SA").split(";"):
+        if not aln:
+            continue
+        fields = aln.split(",")
+        sa_chrom, sa_pos, sa_strand, sa_cigar = fields[0], int(fields[1]), fields[2], fields[3]
+        ref_span = refspan(sa_cigar)
+        if sa_chrom == read.reference_name:
+            if abs((sa_pos + ref_span) - end) <= 1:
+                # strand switch
+                if (sa_strand == "-" and not read.is_reverse) or (sa_strand == "+" and read.is_reverse):
+                    return True
+    return False
+
+def read_supports_DUP(read, chrom, end):
+    if not read.has_tag("SA"):
+        return False
+
+    if read.reference_name != chrom:
+        return False
+    for aln in read.get_tag("SA").split(";"):
+        if not aln:
+            continue
+        fields = aln.split(",")
+        sa_chrom, sa_pos, sa_strand, sa_cigar = fields[0], int(fields[1]), fields[2], fields[3]
+        ref_span = refspan(sa_cigar)
+        if sa_chrom == read.reference_name:
+            if abs((sa_pos + ref_span) - end) <= 1:
+                if (sa_strand == "-" and read.is_reverse) or (sa_strand == "+" and not read.is_reverse):
+                    return True
+    return False
+
 #2: Separate reads by SV
-def separate_reads_by_sv(bam_file, vcf_file, output_dir):
+def separate_reads_by_sv(bam_file, vcf_file, output_dir, args):
     logger.info("reading input files")
     bam = pysam.AlignmentFile(bam_file, 'rb')
     vcf_reader = pysam.VariantFile(vcf_file)
@@ -260,6 +314,8 @@ def separate_reads_by_sv(bam_file, vcf_file, output_dir):
         chrom = record.chrom
         start = record.pos - 1
         ref = record.ref
+        if len(ref) > 6:
+            ref = str(ref[0]) + str(len(ref)-2) + str(ref[-1])
         alt = record.alts[0]
         end = record.stop
         svlen = abs(record.info.get("SVLEN", end - start))
@@ -290,6 +346,12 @@ def separate_reads_by_sv(bam_file, vcf_file, output_dir):
 
             elif svtype == "BND":
                 supports = read_supports_BND(read, chrom, start, alt)
+
+            elif svtype == "INV":
+                supports = read_supports_INV(read, chrom, end)
+
+            elif svtype == "DUP":
+                supports = read_supports_DUP(read, chrom, end)
 
             else:
                 continue
@@ -359,7 +421,8 @@ def index_bam_files(output_dir):
             subprocess.run(["samtools", "index", sorted_bam])
 
 #3. Extract methylation data
-def create_methylation_array(bam_path, meth_cutoff=0.8, unmeth_cutoff=0.2):
+def create_methylation_array(bam_path, meth_cutoff=0.8, unmeth_cutoff=0.2, mem=8):
+    MAX_ARRAY_BYTES = mem * 1024**3  # 8 GB safety limit
     bam = pysam.AlignmentFile(bam_path, "rb")
     methylation_data = {}
 
@@ -369,6 +432,8 @@ def create_methylation_array(bam_path, meth_cutoff=0.8, unmeth_cutoff=0.2):
         read_id = read.query_name
         aligned_positions = {query_pos: ref_pos for query_pos, ref_pos in read.get_aligned_pairs(matches_only=True)}
 
+        if read.modified_bases is None:
+            continue
         for key, values in read.modified_bases.items():
             for base_pos, quality in values:
                 probability = 0
@@ -384,7 +449,31 @@ def create_methylation_array(bam_path, meth_cutoff=0.8, unmeth_cutoff=0.2):
 
     genomic_positions = sorted(methylation_data.keys())
     read_ids = list({read_id for pos_data in methylation_data.values() for read_id in pos_data})
-    methylation_array = np.full((len(genomic_positions), len(read_ids)), np.nan)
+
+    n_rows = len(genomic_positions)
+    n_cols = len(read_ids)
+    estimated_bytes = n_rows * n_cols * 8  # float64 = 8 bytes
+
+    if estimated_bytes > MAX_ARRAY_BYTES:
+        bam.close()
+        print(
+            f"[SKIP] {bam_path}: "
+            f"array would require {estimated_bytes / 1024**3:.2f} GB "
+            f"({n_rows} x {n_cols}), skipping due to memory limit.",
+            file=sys.stderr
+        )
+        return None, None, None
+
+    try:
+        methylation_array = np.full((n_rows, n_cols), np.nan, dtype=np.float64)
+    except (MemoryError, np.core._exceptions._ArrayMemoryError):
+        bam.close()
+        print(
+            f"[SKIP] {bam_path}: NumPy failed to allocate array "
+            f"({n_rows} x {n_cols}), skipping.",
+            file=sys.stderr
+        )
+        return None, None, None
 
     for i, pos in enumerate(genomic_positions):
         for j, read_id in enumerate(read_ids):
@@ -517,7 +606,7 @@ def predict_association(model, image_loader, device):
     return predictions
 
 #6. Methylation diffcs stats
-def compute_methylation_difference(bam_with, bam_without, mincov=3, mincpgs=3, cpgdist = 50, minlen = 50, mergegap = 100, diffthresh=0.2):
+def compute_methylation_difference(bam_with, bam_without, mincov=3, mincpgs=3, cpgdist = 50, minlen = 50, mergegap = 500, diffthresh=0.2):
     bam_w, gp1, _ = create_methylation_array(bam_with)
     bam_wo, gp2, _ = create_methylation_array(bam_without)
 
@@ -576,7 +665,7 @@ def compute_methylation_difference(bam_with, bam_without, mincov=3, mincpgs=3, c
                 diff_regions.append(cur_dregion)
             cur_dregion = [curr]
 
-        if curr['pos'] - prev['pos'] <= 300 and curr['is_sim']==1 and prev['is_sim']==1:
+        if curr['pos'] - prev['pos'] <= 500 and curr['is_sim']==1 and prev['is_sim']==1:
             cur_sregion.append(curr)
         else:
             if len(cur_sregion) >= 10:
@@ -589,7 +678,7 @@ def compute_methylation_difference(bam_with, bam_without, mincov=3, mincpgs=3, c
     if len(cur_sregion) >= 10:
         sim_regions.append(cur_sregion)
 
-    sim_regions  = [r for r in sim_regions  if (r[-1]['pos'] - r[0]['pos']) >= 300]
+    sim_regions  = [r for r in sim_regions  if (r[-1]['pos'] - r[0]['pos']) >= 500]
 
     if not sim_regions: #checks that difference is localised to specific regions, not spread across the whole reads (not global)
         return []
@@ -745,13 +834,11 @@ def annotate_CRE(chrom, region_string, cre_intervals):
     annotations = []
 
     for region in regions:
-        if not region:
+        if not region or '=' not in region:
             annotations.append('NA')
+            continue
 
-        if '=' in region:
-            coord, _ = region.split('=')
-        else:
-            annotations.append('NA')
+        coord, _ = region.split('=')
 
         start, end = map(int, coord.split('-'))
 
@@ -769,10 +856,9 @@ def annotate_CRE(chrom, region_string, cre_intervals):
 
 
 #7. Generate output file
-def generate_output(predictions, dir, output_file, fdrpval=0.05, diffthresh=0.2):
+def generate_output(args, predictions, dir, output_file, fdrpval=0.05, diffthresh=0.2):
     output_list = []
     gtf_annotations = []
-    cre_annotations = []
 
     for prediction in predictions:
         filename, pred_label = prediction
@@ -798,7 +884,11 @@ def generate_output(predictions, dir, output_file, fdrpval=0.05, diffthresh=0.2)
             class_stats = False
         else:
             ranked = sorted(change_meth, key=lambda r: (r['pval_adj'], r['pval']))
-            top5 = ranked[:5]
+            diffm = [r for r in ranked if abs(r['delta_mean']) > diffthresh]
+
+            top5 = diffm[:5]
+            if not top5:
+                top5 = ranked[:5]
             pvals = [r['pval_adj'] for r in top5]
             affected_regions = ";".join(f"{r['start']}-{r['end']}={r['pval_adj']:.3e}" for r in top5)
             delta = ";".join(f"{r['delta_mean']:.3f}" for r in top5)
@@ -829,14 +919,18 @@ def generate_output(predictions, dir, output_file, fdrpval=0.05, diffthresh=0.2)
         df["GTF annotation"] = gtf_annotations
 
     if args.cre:
-        cre_intervals = build_CRE_interval(args.cre)
-        for row in output_list:
-            chrom = row[0] #, start, end, ref, alts, reads_ref, reads_alt, pred, regions, delta, pval = row
-            region = row[8]
-            cre_annot = annotate_CRE(chrom, regions, cre_intervals)
-            cre_annotations.append(cre_annot)
-        df["CRE annotation"] = cre_annotations
-
+        for cre_file in args.cre:
+            cre_annotations = []
+            cre_intervals = build_CRE_interval(cre_file)
+            for row in output_list:
+                chrom = row[0]
+                regions = row[8]
+                cre_annot = annotate_CRE(chrom, regions, cre_intervals)
+                cre_annotations.append(cre_annot)
+            base = os.path.basename(cre_file)
+            name = os.path.splitext(base)[0]
+            col_name = f"{name}_annotation"
+            df[col_name] = cre_annotations
 
     pred_order = ['Positive', 'Negative', 'Amb']
     df['Prediction'] = pd.Categorical(df['Prediction'], categories=pred_order, ordered=True)
@@ -846,7 +940,7 @@ def generate_output(predictions, dir, output_file, fdrpval=0.05, diffthresh=0.2)
     df.to_csv(output_file, sep='\t', index=False)
 
 # Main Function
-def main(args):
+def run(args):
     # Create temporary directory
     tmp_dir = os.path.join(args.tmp, str(uuid4()))
     os.makedirs(tmp_dir, exist_ok=True)
@@ -863,9 +957,9 @@ def main(args):
 
     # Separate reads by variant
     if args.sv:
-        separate_reads_by_sv(args.bam_file, args.vcf_file, tmp_dir)
+        separate_reads_by_sv(args.bam_file, args.vcf_file, tmp_dir, args)
     else:
-        separate_reads_by_variant(args.bam_file, args.vcf_file, tmp_dir)
+        separate_reads_by_variant(args.bam_file, args.vcf_file, tmp_dir, args)
 
     # Index BAM files
     index_bam_files(tmp_dir)
@@ -878,8 +972,8 @@ def main(args):
             without_variant_file = bam_file.replace("_with_variant_sorted.bam", "_without_variant_sorted.bam")
             if os.path.exists(os.path.join(tmp_dir, without_variant_file)):
                 # Generate methylation arrays
-                meth_array1, pos1, _ = create_methylation_array(os.path.join(tmp_dir, bam_file), meth_cutoff=args.meth_cutoff, unmeth_cutoff=args.unmeth_cutoff)
-                meth_array2, pos2, _ = create_methylation_array(os.path.join(tmp_dir, without_variant_file), meth_cutoff=args.meth_cutoff, unmeth_cutoff=args.unmeth_cutoff)
+                meth_array1, pos1, _ = create_methylation_array(os.path.join(tmp_dir, bam_file), meth_cutoff=args.meth_cutoff, unmeth_cutoff=args.unmeth_cutoff, mem=args.memory)
+                meth_array2, pos2, _ = create_methylation_array(os.path.join(tmp_dir, without_variant_file), meth_cutoff=args.meth_cutoff, unmeth_cutoff=args.unmeth_cutoff, mem=args.memory)
 
                 if meth_array1 is not None and meth_array2 is not None:
                     # Create image and add to list
@@ -896,15 +990,19 @@ def main(args):
 
     # Parse SNP data and generate output
     output_file = f'{os.path.splitext(os.path.basename(args.vcf_file))[0]}_output.tsv'
-    generate_output(predictions, tmp_dir, output_file, fdrpval=args.fdrpval, diffthresh=args.diffthresh)
+    generate_output(args, predictions, tmp_dir, output_file, fdrpval=args.fdrpval, diffthresh=args.diffthresh)
 
     # Clean up temporary directory
     subprocess.run(["rm", "-rf", tmp_dir])
     logger.info(f"Results saved to {output_file}")
 
+def main():
+    args = parse_args()
+    run(args)
+
 # Argument Parsing
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Predict SNV associations with methylation using a pre-trained model.")
+def parse_args():
+    parser = argparse.ArgumentParser(description="Predict variant associations with methylation using a pre-trained model.")
 
     parser.add_argument("-b", "--bam_file", help="Input BAM file", required=True)
     parser.add_argument("-v", "--vcf_file", help="Input VCF file", required=True)
@@ -912,19 +1010,22 @@ if __name__ == "__main__":
     parser.add_argument("-r", "--region", help="Limit analysis to a specific region in chr:start-end format; chr1:100-200", required=False)
     parser.add_argument("--meth_cutoff", type=float, default=0.8, help="threshold above which a base is considered methylated (default=0.8)")
     parser.add_argument("--unmeth_cutoff", type=float, default=0.2, help="threshold below which a base is considered unmethylated (default=0.2)")
+    parser.add_argument("--memory", type=int, default=8, help="maximum GB for methylation array. Avoids very large files from INV and DUP SVs")
     parser.add_argument("--mincpgs", type=int, default=3, help="minimum CpGs to consider before defining a region of potential difference (default=3). Can be up to 10")
     parser.add_argument("--cpgdist", type=int, default=50, help="maximum distance between consecutive CpGs in a differential region (default=50)")
-    parser.add_argument("--mergegap", type=int, default=100, help="maximum distance between two identified differential region to merge as one (default=100)")
-    parser.add_argument("--mincov", type=int, default=3, help="minimum number of reads with for a genomic position to be considered for methylation estimation (default=3)")
+    parser.add_argument("--mergegap", type=int, default=500, help="maximum distance between two identified differential region to merge as one (default=100)")
+    parser.add_argument("--mincov", type=int, default=3, help="minimum number of reads for a genomic position to be considered for methylation estimation (default=3)")
     parser.add_argument("--minlen", type=int, default=50, help="minimum length of differential region")
     parser.add_argument("--diffthresh", type=float, default=0.2, help="threshold above which methylation proportion difference is considered big enough (default=0.2)")
     parser.add_argument("--fdrpval", type=float, default=0.05, help="significance cut-off for methylation difference calculated with fisher's test default(0.05)")
-    parser.add_argument("--model", help="pre-trained model; default in model folder", required=True)
-    parser.add_argument("--tmp", help="temp folder that supports writing of thousands of files, depending on variant size", default="/tmp")
+    parser.add_argument("--model", help="path to pre-trained model", default=MODEL_PATH)
+    parser.add_argument("--tmp", help="temp folder that supports writing of thousands of files, depending on variant size", default=os.getcwd())
     parser.add_argument("--gtf", help="tabix-indexed gtf file")
-    parser.add_argument("--cre", help="file with CREs, promoters, enhancers, etc. No header row")
+    parser.add_argument("--cre", action="append", help="file with CREs: promoters, enhancers, repeats etc. No header row; 4 cols of chr, start, end, feature_name")
     parser.add_argument("--sv", action="store_true", help="activate function for structural variants")
 
     args=parser.parse_args()
-    main(args)
+    return args
 
+if __name__ == "__main__":
+    main()
