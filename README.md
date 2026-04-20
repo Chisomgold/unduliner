@@ -28,7 +28,7 @@ and predicts whether the variant is likely to cause a methylation shift.
 
 ## **Installation**
 
-`pip install unduliner`
+`pip install unduliner` in an environment with samtools installed.
 
 ### **Alternatively, clone the repository**
 
@@ -61,19 +61,19 @@ unduliner -h
 
 ### **Some optional arguments**
 
-| Argument          | Default                | Description                                                     |
-| ----------------- | ---------------------- | --------------------------------------------------------------  | 
-| `--chromosome`    | -                      | Chromosome of interest (e.g., chr10)                            |
-| `--region`        | -                      | Region of interest (e.g. chr10:3000-4000)                       |
-| `--mincov`        | 3                      | Minimum read coverage per allele                                |
-| `--mincpgs`       | 3                      | Minimum CpGs required within region                             |
-| `--cpgdist`       | 50                     | Maximum distance allowed between consecutive CpGs               |
-| `--meth_cutoff`   | 0.8                    | Probability threshold for calling methylated                    |
-| `--unmeth_cutoff` | 0.2                    | Probability threshold for calling unmethylated                  |
-| `--tmp`           | working dir            | Dir that supports read/write of many files                      |
-| `--gtf`           | -                      | Tabix-indexed GTF file to annotated diff methylated regions     |
-| `--cre`           | -                      | CRE file for annotation                                         |
-| `--sv`            | -                      | Activates functions for SVs - INS,DEL,BND,DUP,INV               |
+| Argument          | Default                | Description                                                            |
+| ----------------- | ---------------------- | --------------------------------------------------------------------   | 
+| `--chromosome`    | -                      | Chromosome of interest (e.g., chr10)                                   |
+| `--region`        | -                      | Region of interest (e.g. chr10:3000-4000)                              |
+| `--mincov`        | 3                      | Minimum read coverage per allele                                       |
+| `--mincpgs`       | 3                      | Minimum CpGs required within region                                    |
+| `--cpgdist`       | 50                     | Maximum distance allowed between consecutive CpGs                      |
+| `--meth_cutoff`   | 0.8                    | Probability threshold for calling methylated                           |
+| `--unmeth_cutoff` | 0.2                    | Probability threshold for calling unmethylated                         |
+| `--tmp`           | working dir            | Dir that supports read/write of many files                             |
+| `--gtf`           | -                      | Tabix-indexed GTF file to annotated diff methylated regions            |
+| `--cre`           | -                      | BED-style file (4 cols: chr, start, end, feature name) for annotation  |
+| `--sv`            | -                      | Activates functions for SVs - INS,DEL,BND,DUP,INV                      |
 ---
 
 ## **Example command**
@@ -86,7 +86,7 @@ unduliner -b testdata/chr17_2M_225M.bam -v testdata/chr17atcc.vcf.gz
 
 ### for SV
 ```bash
-unduliner -b sample.bam -v SV.vcf.gz --model model/pretrained80.pth --sv
+unduliner -b sample.bam -v SV.vcf.gz --sv
 ```
 
 
