@@ -28,7 +28,15 @@ and predicts whether the variant is likely to cause a methylation shift.
 
 ## **Installation**
 
-`pip install unduliner` in an environment with samtools installed.
+### `pip install unduliner` in an environment with samtools installed.
+
+```bash
+conda create -n unduliner python=3.10
+conda activate unduliner
+conda install -c bioconda samtools
+pip install unduliner
+unduliner
+```
 
 ### **Alternatively, clone the repository**
 
