@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+- family-names: "Atanda"
+  given-names: "Halimat Chisom"
+  orcid: "https://orcid.org/0000-0003-4785-468X"
+- family-names: "Ewing"
+  given-names: "Adam"
+  orcid: "https://orcid.org/0000-0002-4544-994X"
+title: "unduliner"
+version: 1.0.1
+
+date-released: 2026-02-11
+url: "https://github.com/Chisomgold/unduliner"
