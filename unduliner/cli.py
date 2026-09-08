@@ -454,14 +454,18 @@ def create_methylation_array(bam_path, meth_cutoff=0.8, unmeth_cutoff=0.2, mem=8
     n_cols = len(read_ids)
     estimated_bytes = n_rows * n_cols * 8  # float64 = 8 bytes
 
+    summary_path = "read_parse_summary.txt"
     if estimated_bytes > MAX_ARRAY_BYTES:
         bam.close()
-        print(
+        message = (
             f"[SKIP] {bam_path}: "
             f"array would require {estimated_bytes / 1024**3:.2f} GB "
-            f"({n_rows} x {n_cols}), skipping due to memory limit.",
-            file=sys.stderr
+            f"({n_rows} x {n_cols}), skipping due to memory limit."
         )
+        print(message, file=sys.stderr)
+
+        with open(summary_path, "a") as f:
+            f.write(message + "\n")
         return None, None, None
 
     try:
@@ -471,8 +475,11 @@ def create_methylation_array(bam_path, meth_cutoff=0.8, unmeth_cutoff=0.2, mem=8
         print(
             f"[SKIP] {bam_path}: NumPy failed to allocate array "
             f"({n_rows} x {n_cols}), skipping.",
-            file=sys.stderr
         )
+        print(message, file=sys.stderr)
+
+        with open(summary_path, "a") as f:
+            f.write(message + "\n")
         return None, None, None
 
     for i, pos in enumerate(genomic_positions):
@@ -884,7 +891,7 @@ def generate_output(args, predictions, dir, output_file, fdrpval=0.05, diffthres
             class_stats = False
         else:
             ranked = sorted(change_meth, key=lambda r: (r['pval_adj'], r['pval']))
-            diffm = [r for r in ranked if abs(r['delta_mean']) > diffthresh]
+            diffm = [r for r in ranked if abs(r['delta_mean']) > diffthresh and r['pval_adj'] < fdrpval]
 
             top5 = diffm[:5]
             if not top5:
