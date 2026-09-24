@@ -120,7 +120,7 @@ unduliner -b sample.bam -v SV.vcf.gz --sv
 * **Top 5 DMHs:** <= 5 Genomic intervals with smallest adjusted p-values
 * **Meth-prop-diffs:** Δ(methylation) between ref-allele reads and alt-allele reads, where a negative value means reduced 
 methylation on the variant reads compared to the reference.
-* **Start/End:** The SNV genomic coordinate (End = variant position)
+* **Start/End:** The variant genomic coordinate (End = 1-based variant position for SNVs; and corresponds to the END in SV vcf file)
 * Extra columns for GTF and CREs by user-request. The `--cre` option can be used multiple times; files should be tab/space-delimited.
 Only the first 4 columns will be used with chr, start, end, as the first 3 columns respectively and the fourth column is a 
 genomic feature relevant to that region like promoter, enhancer, repeats, etc. 
