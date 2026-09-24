@@ -1,6 +1,6 @@
 # **unduliner**
 
-### *Predicting methylation-altering single nucleotide variants (SNVs) and structural variants (SVs) from nanopore sequencing*
+### *Predicting methylation-associated single nucleotide variants (SNVs) and structural variants (SVs) from nanopore sequencing*
 
 `unduliner` is a Python package designed to predict whether a somatic variant is associated with local methylation change, 
 using nanopore long-read sequencing and a pre-trained deep learning model.
@@ -130,7 +130,9 @@ genomic feature relevant to that region like promoter, enhancer, repeats, etc.
 
 ## **Citing unduliner**
 
-If you use **unduliner** in your research, please cite the repository:
+If you use **unduliner** in your research, please cite:
+
+> Atanda, H. C., & Ewing, A. (2026). unduliner (Version v1.0.4) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.22652670
 
 
 A manuscript is in preparation.
