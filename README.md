@@ -11,7 +11,7 @@ The tool takes as input:
 * One VCF file
 * A trained model (`.pth`, included in the `model/` directory and added by default to options)
 
-It extracts genomic regions around each variants, evaluates methylation differences using a statistical and deep learning pipeline, 
+It extracts genomic regions around each variant, evaluates methylation differences using a statistical and deep learning pipeline, 
 and predicts whether the variant is likely to cause a methylation shift.
 
 ---
@@ -121,21 +121,22 @@ unduliner -b sample.bam -v SV.vcf.gz --sv
 * **Meth-prop-diffs:** Δ(methylation) between ref-allele reads and alt-allele reads, where a negative value means reduced 
 methylation on the variant reads compared to the reference.
 * **Start/End:** The variant genomic coordinate (End = 1-based variant position for SNVs; and corresponds to the END in SV vcf file)
-* Extra columns for GTF and CREs by user-request. The `--cre` option can be used multiple times; files should be tab/space-delimited.
-Only the first 4 columns will be used with chr, start, end, as the first 3 columns respectively and the fourth column is a 
-genomic feature relevant to that region like promoter, enhancer, repeats, etc. 
+* Extra columns for GTF and CREs by user request. The `--cre` option can be used multiple times; files should be tab/space-delimited.
+Only the first 4 columns will be used with chr, start, end, as the first 3 columns respectively, and the fourth column is a 
+genomic feature relevant to that region, like promoter, enhancer, repeats, etc. 
 
 ---
 
 
 ## **Citing unduliner**
 
-If you use **unduliner** in your research, please cite:
+If you use **unduliner** in your research, please cite the software:
 
 > Atanda, H. C., & Ewing, A. (2026). unduliner (Version v1.0.4) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.22652670
 
+and the preprint:
 
-A manuscript is in preparation.
+> Atanda, H. C., & Ewing, A. D. (2026). Linking somatic variants to altered methylation profiles in nanopore-derived breast and pancreatic cancer genomes using unduliner. bioRxiv. https://doi.org/10.64898/2026.10.08.757715
 
 ---
 
