@@ -726,11 +726,6 @@ def compute_methylation_difference(bam_with, bam_without, mincov=3, mincpgs=3, c
         results.append({'start': start, 'end': end, 'delta_mean': np.mean([r['delta'] for r in region]), 'pval': pval})
     if not results:
         return []
-    pvals = np.array([x['pval'] for x in results])
-    _, pval_corr, _, _ = multitest.multipletests(pvals, method='fdr_bh')
-
-    for i, rs in enumerate(results):
-        rs['pval_adj'] = float(pval_corr[i])
 
     return results
 
@@ -866,6 +861,8 @@ def annotate_CRE(chrom, region_string, cre_intervals):
 def generate_output(args, predictions, dir, output_file, fdrpval=0.05, diffthresh=0.2):
     output_list = []
     gtf_annotations = []
+    all_regions = []
+    variant_result = []
 
     for prediction in predictions:
         filename, pred_label = prediction
@@ -883,14 +880,28 @@ def generate_output(args, predictions, dir, output_file, fdrpval=0.05, diffthres
         reads_ref = sum(1 for _ in pysam.AlignmentFile(bam_without, 'rb'))
 
         change_meth = compute_methylation_difference(bam_with, bam_without, mincov=args.mincov, mincpgs=args.mincpgs, cpgdist=args.cpgdist, minlen=args.minlen, mergegap=args.mergegap, diffthresh=args.diffthresh)
+        variant_result.append({'Chr': chrom, 'Start': start, 'End': end, 'Ref': ref, 'Alt': alts, 'Reads_with_Ref': reads_ref, 'Reads_with_Alt': reads_alt, 'Prediction': pred_label, 'regions': change_meth if change_meth else []})
 
-        if not change_meth:
+        if change_meth:
+            for region in change_meth:
+                all_regions.append(region)
+    if all_regions:
+        pvals = np.array([r['pval'] for r in all_regions])
+        _, qvals, _, _ = multitest.multipletests(pvals, method='fdr_bh')
+        for region, qval in zip (all_regions, qvals):
+            region['pval_adj'] = float(qval)
+
+    for result in variant_result:
+        regions = result['regions']
+        pred_label = result['Prediction']
+
+        if not regions:
             affected_regions = "NA"
             delta = "NA"
             pval_min = "NA"
             class_stats = False
         else:
-            ranked = sorted(change_meth, key=lambda r: (r['pval_adj'], r['pval']))
+            ranked = sorted(regions, key=lambda r: (r['pval_adj'], r['pval']))
             diffm = [r for r in ranked if abs(r['delta_mean']) > diffthresh and r['pval_adj'] < fdrpval]
 
             top5 = diffm[:5]
@@ -912,7 +923,7 @@ def generate_output(args, predictions, dir, output_file, fdrpval=0.05, diffthres
         if class_stats == False and pred_label == 'positive':
              association = 'Amb'
 
-        output_list.append([chrom, start, end, ref, alts, reads_ref, reads_alt, association, affected_regions, delta, pval_min])
+        output_list.append([result['Chr'], result['Start'], result['End'], result['Ref'], result['Alt'], result['Reads_with_Ref'], result['Reads_with_Alt'], association, affected_regions, delta, pval_min])
 
     df = pd.DataFrame(output_list, columns=['Chr', 'Start', 'End', 'Ref', 'Alt', 'Reads_with_Ref', 'Reads_with_Alt', 'Prediction', 'Top 5 DMHs',  'Meth-prop-diffcs', 'min-pval'])
 
@@ -1010,6 +1021,9 @@ def main():
 # Argument Parsing
 def parse_args():
     parser = argparse.ArgumentParser(description="Predict variant associations with methylation using a pre-trained model.")
+
+    __version__ = "1.1.0"
+    parser.add_argument('--version', action='version', version='%(prog)s {version}'.format(version=__version__))
 
     parser.add_argument("-b", "--bam_file", help="Input BAM file", required=True)
     parser.add_argument("-v", "--vcf_file", help="Input VCF file", required=True)
